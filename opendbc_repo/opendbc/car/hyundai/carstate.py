@@ -308,6 +308,9 @@ class CarState(CarStateBase):
     self.HAS_LFA_BUTTON, self.CRUISE_BUTTON_ALT, self.CRUISE_BUTTON_LFA = (
       _get_legacy_button_capabilities(fingerprints[0])
     )
+    is_casper = self.CP.carFingerprint in (CAR.HYUNDAI_CASPER, CAR.HYUNDAI_CASPER_EV)
+    self.CRUISE_BUTTON_ALT = self.CRUISE_BUTTON_ALT and is_casper
+    self.CRUISE_BUTTON_LFA = self.CRUISE_BUTTON_LFA and is_casper
 
     cam_bus = CanBus(CP).CAM
     pt_bus = CanBus(CP).ECAN
