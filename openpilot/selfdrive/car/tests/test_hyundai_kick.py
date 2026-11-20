@@ -4,6 +4,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from openpilot.selfdrive.car import hyundai_kick as kick
+from opendbc.car.hyundai.spas import SPAS
 from tools.jetlink.blink_owner import Owner, GRACE, external_output_allowed  # noqa: TID251
 
 
@@ -25,13 +26,183 @@ def test_external_gate(onroad, spas, enabled):
   assert external_output_allowed(NS(get_bool=values.get)) == (onroad and not spas and not enabled)
 
 
+@pytest.fixture
+def source_output(output, monkeypatch):
+  gate, values = output
+  incoming, feedback = {}, []
+  worker = NS(process=NS(poll=lambda: None), latest=lambda: incoming,
+              send=lambda value: feedback.append(value), close=lambda **kw: None)
+  monkeypatch.setattr(kick, 'Process', lambda *args: worker)
+  cs = NS(canValid=True, gearShifter='drive', blinkerLever=False, leftBlinker=False, rightBlinker=False)
+  return gate, values, incoming, feedback, cs
+
+
+def hold_record(record, now, ident='hold-1', direction='left', started=None):
+  record.update(stamp=now, ok=True, events=[], hold={
+    'id': ident, 'direction': direction, 'time': now if started is None else started, 'source': 'lane'})
+
+
+def submitted(side):
+  data = bytearray(32)
+  data[16] = side << 5
+  return [(0x16A, bytes(data), 0)]
+
+
+def test_common_hold_acknowledgement_and_stop(source_output):
+  gate, _, record, feedback, cs = source_output
+  hold_record(record, 10.)
+  assert gate.request(cs, 10., True, True) == 3
+  gate.feedback(cs, 10., [])
+  assert feedback[-1]['accepted_id'] is None
+  gate.feedback(cs, 10.1, submitted(3))
+  assert feedback[-1]['accepted_id'] == 'hold-1'
+  assert feedback[-1]['first_sent'] == 10.1
+  gate.feedback(cs, 10.2, submitted(3))
+  assert feedback[-1]['first_sent'] == 10.1
+  for now in (11., 25., 60.):
+    hold_record(record, now, started=10.)
+    assert gate.request(cs, now, True, True) == 3
+  record.update(stamp=60.1, hold=None)
+  assert gate.request(cs, 60.1, True, True) == 0
+  gate.feedback(cs, 60.1, [])
+  assert feedback[-1]['accepted_id'] is None
+
+
+@pytest.mark.parametrize('starting', [False, True])
+def test_request_samples_freshness_after_reading_worker(source_output, starting):
+  gate, _, record, _, cs = source_output
+  if not starting:
+    hold_record(record, 10.)
+    assert gate.request(cs, 10., True, True) == 3
+  # Source publishes between card's earlier timestamp and latest() returning.
+  hold_record(record, 10.1002, started=10.1002 if starting else 10.)
+  assert gate.request(cs, 10.1, True, True, clock=lambda: 10.1004) == 3
+  assert gate.request_id == 'hold-1'
+
+
+@pytest.mark.parametrize('stamp', [9., 10.3])
+def test_post_read_clock_still_rejects_expired_or_future_records(source_output, stamp):
+  gate, _, record, _, cs = source_output
+  hold_record(record, 10.)
+  assert gate.request(cs, 10., True, True) == 3
+  hold_record(record, stamp, started=10.)
+  assert gate.request(cs, 10.1, True, True, clock=lambda: 10.1004) == 0
+
+
+def test_request_end_records_one_bounded_diagnostic(source_output):
+  gate, _, record, _, cs = source_output
+  events = []
+  gate.event = lambda name, **data: events.append((name, data))
+  hold_record(record, 10.)
+  assert gate.request(cs, 10., True, True) == 3
+  assert gate.request(cs, 10.3, True, True) == 0
+  assert gate.request(cs, 10.4, True, True) == 0
+  assert len(events) == 1
+  name, data = events[0]
+  assert name == 'canfdIndicatorRequestEnd'
+  assert data['request'] == 'hold-1' and data['first_sent'] is None
+  assert not data['healthy'] and data['continuing'] and data['ready']
+  assert data['source_stamp'] == 10. and data['now'] == 10.3
+  assert 'error' not in data
+
+
+@pytest.mark.parametrize('fault', ['old_record', 'future_record', 'invalid', 'owner', 'lever', 'hazard', 'gear', 'opposite', 'cancel'])
+def test_interrupted_hold_cannot_resume_same_id(source_output, fault):
+  gate, _, record, _, cs = source_output
+  hold_record(record, 10.)
+  assert gate.request(cs, 10., True, True) == 3
+  hold_record(record, 10.1, started=10.)
+  record['stamp'] = 9. if fault == 'old_record' else 11. if fault == 'future_record' else 10.1
+  record['ok'] = fault != 'invalid'
+  cs.blinkerLever = fault == 'lever'
+  cs.leftBlinker = fault == 'hazard'
+  cs.rightBlinker = fault in ('hazard', 'opposite')
+  cs.gearShifter = 'park' if fault == 'gear' else 'drive'
+  if fault == 'cancel':
+    record['hold'] = None
+  assert gate.request(cs, 10.1, True, fault != 'owner') == 0
+  cs.blinkerLever = cs.leftBlinker = cs.rightBlinker = False
+  cs.gearShifter = 'drive'
+  hold_record(record, 10.2, started=10.)
+  assert gate.request(cs, 10.2, True, True) == 0
+  hold_record(record, 10.3, ident='hold-2')
+  assert gate.request(cs, 10.3, True, True) == 3
+
+
+def test_explicit_tap_is_once_and_bounded_after_handshake(source_output):
+  gate, _, record, _, cs = source_output
+  record.update(stamp=10., ok=True, hold=None, events=[{'id': 'tap', 'time':10., 'direction':'right'}])
+  assert gate.request(cs, 10., True, True) == 4
+  record.update(stamp=10.5, events=[])
+  assert gate.request(cs, 10.5, True, True) == 4
+  gate.feedback(cs, 10.5, submitted(4))
+  record['stamp'] = 11.49
+  assert gate.request(cs, 11.49, True, True) == 4
+  record['stamp'] = 11.51
+  assert gate.request(cs, 11.51, True, True) == 0
+
+
+def test_output_toggle_closes_worker_without_replaying_old_request(source_output):
+  gate, values, record, _, cs = source_output
+  hold_record(record, 10.)
+  assert gate.request(cs, 10., True, True) == 3
+  values['CanfdBlinkerKick'] = False
+  assert gate.request(cs, 10.1, True, False) == 0
+  assert gate.worker is None
+  values['CanfdBlinkerKick'] = True
+  hold_record(record, 11.2, started=10.)
+  assert gate.request(cs, 11.2, True, True) == 0
+
+
+@pytest.mark.parametrize('mode', [0, 1, 2])
+@pytest.mark.parametrize('selected', [False, True])
+@pytest.mark.parametrize('legacy_mode', [0, 1, 2, 3, 4])
+def test_common_detector_settings_match_external_output(mode, selected, legacy_mode):
+  import ast
+  from pathlib import Path
+  path = Path(__file__).parents[2] / 'controls/lib/desire_helper.py'
+  method = next(node for node in ast.walk(ast.parse(path.read_text(encoding='utf-8')))
+                if isinstance(node, ast.FunctionDef) and node.name == '_update_params_periodic')
+  scope = {'RUNTIME':Path('.'), 'read_json':lambda *args:{}, 'time':NS(monotonic=lambda:10.), 'CV':NS(KPH_TO_MS=1/3.6)}
+  exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), scope)
+  for native in (False, True):
+    bools = dict.fromkeys(('ManualLaneChangeIndicator', 'ManualTurnIndicator', 'ModelDesireIndicator', 'ModelPathIndicator'), selected)
+    bools['CanfdBlinkerKick'] = native
+    ints = {'AutoBlinkerControl':mode, 'CanfdBlinkerKickModelMode':legacy_mode}
+    reads = []
+    def get_int(key, reads=reads, ints=ints):
+      reads.append(key)
+      return ints.get(key, 0)
+    helper = NS(frame=100, kick_supported=native, external_indicator_supported=not native,
+                boundary_indicator_supported=True, indicator_journal_time=0.,
+                params=NS(get_bool=lambda key, bools=bools:bools.get(key, False), get_int=get_int, get_float=lambda key:0.))
+    scope['_update_params_periodic'](helper)
+    assert helper.manual_indicator_minimum == (2. if native else 0.)
+    for name in ('boundary_indicator_enabled', 'manual_turn_indicator_enabled', 'model_desire_indicator_enabled', 'model_path_indicator_enabled'):
+      assert getattr(helper, name) == (selected and mode in (1, 2))
+    assert 'CanfdBlinkerKickModelMode' not in reads
+
+
+def test_kick_uses_advertised_common_voice_route():
+  from openpilot.selfdrive.car.voice_indicator import native_indicator
+  from opendbc.car.hyundai.values import HyundaiFlags
+  flags = HyundaiFlags.CANFD | HyundaiFlags.CANFD_HDA2 | HyundaiFlags.ENABLE_BLINKERS
+  cp = NS(brand='hyundai', passive=False, flags=flags, safetyConfigs=[NS(safetyParam=32768)])
+  assert native_indicator(cp) is None
+  cp.safetyConfigs[0].safetyParam = 0
+  assert native_indicator(cp) == 'SPAS2'
+
+
 def test_toggle_and_stale_input_release_ownership(output):
   gate, values = output
+  prime_contract(gate)
   assert gate.update(True, 10.)
   values['CanfdBlinkerKick'] = False
   assert not gate.update(True, 10.01)
   assert not gate.owner.held
   values['CanfdBlinkerKick'] = True
+  assert not gate.update(True, 10.1)  # Reacquisition needs fresh stock again.
+  prime_contract(gate, 10.1)
   assert gate.update(True, 10.1)
   assert not gate.update(False, 10.11)
   assert not gate.owner.held
@@ -43,6 +214,7 @@ def test_toggle_and_stale_input_release_ownership(output):
 def test_waits_for_model_lamp_isolation(output, monkeypatch, tmp_path, direction):
   gate, _ = output
   monkeypatch.setattr(kick, 'RUNTIME', tmp_path)
+  prime_contract(gate)
   assert gate.update(True, 10.)
   data = bytearray(32)
   data[16] = (direction + 2) << 5
@@ -202,7 +374,7 @@ def test_verified_driver_is_recognized_while_native_lamp_mask_is_active(output, 
   path = Path(__file__).parents[2] / 'controls/lib/desire_helper.py'
   methods = [n for n in ast.walk(ast.parse(path.read_text(encoding='utf-8')))
              if isinstance(n, ast.FunctionDef) and n.name in ('_update_driver_blinker', '_update_stalk')]
-  ns = dict(BLINKER_NONE=0, BLINKER_LEFT=1, BLINKER_RIGHT=2, DT_MDL=.05)
+  ns = {'BLINKER_NONE': 0, 'BLINKER_LEFT': 1, 'BLINKER_RIGHT': 2, 'DT_MDL': .05}
   exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), 'exec'), ns)
   observer = BoundaryIndicator()
   observer.own(10., direction)
@@ -243,6 +415,10 @@ def test_native_waits_for_external_release_and_receiver_expiry(output, tmp_path,
   clock[0] += .1
   assert not gate.update(True, clock[0])
   clock[0] += GRACE
+  assert not gate.update(True, clock[0])  # Ownership alone cannot admit CAN output.
+  assert gate.owner.held
+  clock[0] += .18
+  prime_contract(gate, clock[0])
   assert gate.update(True, clock[0])
   assert not external.acquire(True)
   values['CanfdBlinkerKick'] = False
@@ -260,6 +436,10 @@ def test_production_card_send_boundary(output, monkeypatch, tmp_path, blocked):
   from openpilot.selfdrive.pandad import can_list_to_can_capnp
 
   gate, values = output
+  record = {}
+  hold_record(record, 10.)
+  worker = NS(process=NS(poll=lambda:None), latest=lambda:record, send=lambda value:True, close=lambda **kw:None)
+  monkeypatch.setattr(kick, 'Process', lambda *args:worker)
   values['ImpactDashcamReboot'] = blocked == 'dashcam'
   values['CanfdBlinkerKick'] = blocked != 'off'
   monkeypatch.setattr(kick, 'RUNTIME', tmp_path)
@@ -283,7 +463,7 @@ def test_production_card_send_boundary(output, monkeypatch, tmp_path, blocked):
   payload = bytearray(32)
   payload[16] = 3 << 5
   def apply(*args):
-    frames = [(0x16A, bytes(payload), 0)] if controller.kick_output_ready else []
+    frames = [(0x16A, bytes(payload), 0)] if controller.kick_output_ready and controller.kick_direction else []
     return car.CarControl.Actuators.new_message().as_reader(), frames
   stages = ('apply', 'sendcan', 'total')
   sent = []
@@ -294,6 +474,7 @@ def test_production_card_send_boundary(output, monkeypatch, tmp_path, blocked):
             card_diag_stage_current=dict.fromkeys(stages, 0), card_diag_stage_sum_us=dict.fromkeys(stages, 0),
             card_diag_stage_max_us=dict.fromkeys(stages, 0), card_diag_process_max_us=0,
             card_diag_slow_process=0, card_diag_frames=0)
+  prime_contract(gate)
   cs = car.CarState.new_message(canValid=blocked != 'invalid_can', gearShifter='drive')
   if blocked == 'driver':
     gate.update(True, 10.)
@@ -301,3 +482,61 @@ def test_production_card_send_boundary(output, monkeypatch, tmp_path, blocked):
   ns['controls_update'](card, cs.as_reader(), car.CarControl.new_message().as_reader())
   with log.Event.from_bytes(sent[-1][1]) as event:
     assert len(event.sendcan) == int(blocked is None)
+
+
+def prime_contract(gate, now=10., fault=None):
+  from opendbc.car.hyundai.spas import frame
+  gate.owner.held = True
+  cs = NS(canValid=True)
+  for counter in range(10):
+    stamp = now - (9-counter)*.02
+    gate.owner.renewed = stamp
+    packets = [frame(addr, counter if fault != 'counter' else 0, None, gate.bus) for addr in SPAS]
+    if fault == 'missing':
+      packets = packets[:1]
+    if fault == 'crc':
+      packets = [(addr, bytes(len(data)), bus) for addr, data, bus in packets]
+    if fault == 'bus':
+      packets = [(addr, data, bus+1) for addr, data, bus in packets]
+    if fault == 'length':
+      packets = [(addr, data[:8], bus) for addr, data, bus in packets]
+    gate.observe_driver([(int(stamp*1e9)-100, packets), lever_frame(0, stamp-1e-7)], cs, stamp)
+
+
+@pytest.mark.parametrize('fault', ['missing', 'crc', 'counter', 'bus', 'length', 'stale', 'driver_stale', None])
+def test_kick_requires_live_protocol_before_any_request(output, fault):
+  gate, _ = output
+  assert not gate.update(True, 10.)
+  prime_contract(gate, fault=fault)
+  if fault == 'driver_stale':
+    gate.driver_stamp = 9.
+  assert bool(gate.update(True, 10.2 if fault == 'stale' else 10.)) == (fault is None)
+
+
+def test_admitted_kick_allows_ecu_silence_but_requires_fresh_driver(output):
+  gate, _ = output
+  prime_contract(gate)
+  assert gate.update(True, 10.)
+  gate.request_id = 'active'
+  gate.owner.renewed = 10.2
+  gate.observe_driver([lever_frame(0, 10.2)], NS(canValid=True), 10.2)
+  assert gate.update(True, 10.2)
+  assert not gate.update(True, 10.6)
+  gate.request_id = None
+  gate.driver_stamp = 10.6
+  assert not gate.update(True, 10.6)  # A new request cannot reuse the old stock admission.
+
+
+@pytest.mark.parametrize('counter,corrupt', [(9, False), (11, False), (10, True)])
+def test_active_kick_stops_on_invalid_stock_contract(output, counter, corrupt):
+  from opendbc.car.hyundai.spas import frame
+  gate, _ = output
+  prime_contract(gate)
+  assert gate.update(True, 10.)
+  gate.request_id = 'active'
+  packet = frame(0x16A, counter, None, gate.bus)
+  if corrupt:
+    packet = (packet[0], bytes(32), packet[2])
+  gate.owner.renewed = 10.02
+  gate.observe_driver([(10_020_000_000, [packet]), lever_frame(0, 10.02)], NS(canValid=True), 10.02)
+  assert not gate.update(True, 10.02)

@@ -60,6 +60,8 @@ jobs:
             openpilot/selfdrive/controls/tests/test_desire_helper_stalk.py \
             openpilot/selfdrive/controls/tests/test_assistant_lane.py \
             openpilot/selfdrive/car/tests/test_assistant_speed.py \
+            openpilot/selfdrive/car/tests/test_cruise_timing.py \
+            openpilot/common/tests/test_runtime_diagnostics.py \
             openpilot/selfdrive/controls/tests/test_lever_forced_turn.py \
             openpilot/selfdrive/carrot/tests/test_xiaoge_data.py \
             tools/signal_validation/test_trial_integration.py \
@@ -73,11 +75,15 @@ jobs:
         run: |
           python tools/signal_validation/run.py \
             openpilot/selfdrive/car/tests/test_hyundai_kick.py \
+            tools/jetlink/test_blinker_boundary.py \
+            tools/jetlink/test_boundary_recent_intent.py \
+            tools/jetlink/test_manual_turn_indicator.py \
+            tools/jetlink/test_indicator_reconstruction.py \
+            tools/jetlink/test_indicator_continuity.py \
             openpilot/selfdrive/car/tests/test_card_diagnostics.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_aprk_blinkers.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_camera_set_speed_sync.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_ccnc_cluster.py \
-            opendbc_repo/opendbc/car/hyundai/tests/test_lane_crossing.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_stock_cruise_adopt.py \
             opendbc_repo/opendbc/safety/tests/test_hyundai_canfd_spas_piggyback.py \
             openpilot/selfdrive/carrot/tests/test_radar_moving_lead_shield.py \

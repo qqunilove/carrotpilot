@@ -150,7 +150,7 @@ class Car:
     stock_signal = native_indicator(self.CP)
     self.native_voice_indicator = NativeVoiceIndicator(stock_signal) if stock_signal else None
     self.spas_signals = SpasSignals(self.CP, self.params)
-    self.kick_output = KickOutput(self.CP, self.params)
+    self.kick_output = KickOutput(self.CP, self.params, event=cloudlog.event)
     self.spas_signal_status = None
     self.spas_signal_log_at = 0.
 
@@ -216,7 +216,7 @@ class Car:
     self.card_diag_stage_current = dict.fromkeys(self.card_diag_stage_names, 0)
     self.card_diag_stage_sum_us = dict.fromkeys(self.card_diag_stage_names, 0)
     self.card_diag_stage_max_us = dict.fromkeys(self.card_diag_stage_names, 0)
-    self.runtime_diagnostics = RuntimeDiagnostics('card', cloudlog.event)
+    self.runtime_diagnostics = RuntimeDiagnostics('card', cloudlog.event, peak_metric='state_tail_ms')
 
   def _log_tesla_signals(self, CS, now: int) -> None:
     changed = self.tesla_signals.status != self.tesla_signal_status
@@ -461,7 +461,11 @@ class Car:
         kick_valid = (CS.canValid and not impact_reboot and model_v2 is not None and
                       all(self.sm.valid[k] and self.sm.alive[k] and 0 <= time.monotonic()-self.sm.recv_time[k] < .2
                           for k in ('carControl', 'modelV2')))
-        self.CI.CC.kick_output_ready = self.kick_output.update(kick_valid, time.monotonic())
+        kick_now = time.monotonic()
+        self.CI.CC.kick_output_ready = self.kick_output.update(kick_valid, kick_now)
+        self.CI.CC.kick_direction = self.kick_output.request(
+          CS, kick_now, self.initialized_prev, self.CI.CC.kick_output_ready, clock=time.monotonic)
+        self.CI.CC.kick_request_id = self.kick_output.request_id
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos, model_v2, radar_state)
       can_sends = self.kick_output.isolate(can_sends, model_v2, time.monotonic())
       if self.tesla_signals.configured:
@@ -481,6 +485,8 @@ class Car:
       apply_done_ns = time.monotonic_ns()
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
       sendcan_done_ns = time.monotonic_ns()
+      if self.kick_output.configured:
+        self.kick_output.feedback(CS, sendcan_done_ns * 1e-9, can_sends)
       if self.native_voice_indicator is not None:
         self.native_voice_indicator.update(sendcan_done_ns * 1e-9, CC, CS, self.CI.CS, can_sends)
 
@@ -556,10 +562,13 @@ class Car:
     self.initialized_prev = initialized
     self.CS_prev = CS
     self.runtime_diagnostics.record(
-      context={'can_backend': CAN_BACKEND},
+      context={'can_backend': CAN_BACKEND, 'cruise_frame': self.v_cruise_helper.frame,
+               'cruise_params_refreshed': (self.v_cruise_helper.frame - 1) % 10 == 0,
+               'state_receive_mono_ns': self.card_diag_recv_ns},
       work_ms=(time.monotonic_ns() - self.card_diag_recv_ns) / 1e6,
       thread_cpu_ms=(time.thread_time() - cpu_start) * 1000,
       **{f'{name}_ms': value / 1000 for name, value in self.card_diag_stage_current.items()},
+      **self.v_cruise_helper.runtime_timing,
     )
 
   def params_thread(self, evt):
